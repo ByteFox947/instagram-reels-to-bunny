@@ -8,32 +8,43 @@ need a logged-in session (cookies.txt exported from your browser) and may change
 """
 
 import http.cookiejar
+import logging
 import time
 from typing import Iterator
 
 import requests
+
+from .errors import FatalError, RetryableError
+
+log = logging.getLogger("reels2bunny")
 
 IG_WEB = "https://www.instagram.com"
 # Public app id used by the instagram.com web client
 IG_APP_ID = "936619743392459"
 
 
-class ProfileError(RuntimeError):
-    pass
-
-
 def load_cookies(session: requests.Session, cookies_file: str) -> None:
     jar = http.cookiejar.MozillaCookieJar(cookies_file)
-    jar.load(ignore_discard=True, ignore_expires=True)
+    try:
+        jar.load(ignore_discard=True, ignore_expires=True)
+    except FileNotFoundError:
+        raise FatalError(f"Cookies file not found: {cookies_file}")
+    except (http.cookiejar.LoadError, OSError) as exc:
+        raise FatalError(f"Can't read cookies file {cookies_file} (must be Netscape "
+                         f"cookies.txt format): {exc}")
     session.cookies.update(jar)
 
 
 class ProfileReels:
-    def __init__(self, session: requests.Session, cookies_file: str | None, delay: float = 1.5):
+    def __init__(self, session: requests.Session, cookies_file: str | None,
+                 delay: float = 1.5, retries: int = 5):
         self.session = session
         self.delay = delay
+        self.retries = retries
         if cookies_file:
             load_cookies(session, cookies_file)
+        else:
+            log.warning("No --cookies given: Instagram usually requires login to list reels")
         self.headers = {
             "x-ig-app-id": IG_APP_ID,
             "x-requested-with": "XMLHttpRequest",
@@ -44,32 +55,60 @@ class ProfileReels:
             ),
         }
 
-    def _check(self, resp: requests.Response, what: str) -> dict:
-        if resp.status_code in (401, 403) or "login" in resp.url:
-            raise ProfileError(f"{what}: not logged in / blocked. Export fresh cookies.txt.")
-        if resp.status_code == 404:
-            raise ProfileError(f"{what}: not found")
+    def _call(self, method: str, url: str, what: str, **kwargs) -> dict:
+        """Request with retry/backoff on rate limits and network errors."""
+        for attempt in range(1, self.retries + 1):
+            try:
+                return self._once(method, url, what, **kwargs)
+            except RetryableError as exc:
+                if attempt == self.retries:
+                    raise
+                wait = min(300, self.delay * 2 ** attempt * 5)  # 15s, 30s, 60s, ...
+                log.warning("%s (attempt %d/%d) - waiting %.0fs", exc, attempt,
+                            self.retries, wait)
+                time.sleep(wait)
+        raise AssertionError("unreachable")
+
+    def _once(self, method: str, url: str, what: str, **kwargs) -> dict:
+        try:
+            resp = self.session.request(method, url, timeout=30, **kwargs)
+        except requests.RequestException as exc:
+            raise RetryableError(f"{what}: network error: {exc}") from exc
+        code = resp.status_code
+        if code == 429:
+            raise RetryableError(f"{what}: rate limited by Instagram")
+        if code >= 500:
+            raise RetryableError(f"{what}: Instagram server error {code}")
+        if code in (401, 403) or "accounts/login" in (resp.url or ""):
+            raise FatalError(f"{what}: not logged in or blocked (HTTP {code})\n"
+                             "  -> export fresh cookies.txt from a logged-in browser")
+        if code == 404:
+            raise FatalError(f"{what}: not found (check the username)")
         try:
             data = resp.json()
         except ValueError:
-            raise ProfileError(f"{what}: unexpected non-JSON response ({resp.status_code})")
-        if resp.status_code >= 400 or data.get("status") == "fail":
-            raise ProfileError(f"{what}: {resp.status_code} {data.get('message', '')}")
+            # HTML instead of JSON usually means a login wall / challenge page
+            raise FatalError(f"{what}: Instagram returned a web page instead of data "
+                             "(login/challenge required) -> refresh your cookies")
+        if data.get("require_login") or data.get("message") == "checkpoint_required":
+            raise FatalError(f"{what}: Instagram wants you to log in / confirm a checkpoint "
+                             "in the browser, then export fresh cookies")
+        if "wait a few minutes" in str(data.get("message", "")).lower():
+            raise RetryableError(f"{what}: {data['message']}")
+        if code >= 400 or data.get("status") == "fail":
+            raise FatalError(f"{what}: HTTP {code} {data.get('message', '')}")
         return data
 
     def user_id(self, username: str) -> str:
-        resp = self.session.get(
-            f"{IG_WEB}/api/v1/users/web_profile_info/",
-            params={"username": username},
-            headers={**self.headers, "referer": f"{IG_WEB}/{username}/"},
-            timeout=30,
-        )
-        data = self._check(resp, f"profile '{username}'")
+        what = f"profile '{username}'"
+        data = self._call("GET", f"{IG_WEB}/api/v1/users/web_profile_info/", what,
+                          params={"username": username},
+                          headers={**self.headers, "referer": f"{IG_WEB}/{username}/"})
         user = (data.get("data") or {}).get("user")
         if not user:
-            raise ProfileError(f"profile '{username}' not found")
+            raise FatalError(f"{what} not found")
         if user.get("is_private") and not user.get("followed_by_viewer"):
-            raise ProfileError(f"profile '{username}' is private and you don't follow it")
+            raise FatalError(f"{what} is private and the logged-in account doesn't follow it")
         return str(user["id"])
 
     def iter_reels(self, username: str) -> Iterator[dict]:
@@ -77,18 +116,16 @@ class ProfileReels:
         uid = self.user_id(username)
         max_id = ""
         seen: set[str] = set()
+        page = 0
         while True:
+            page += 1
             form = {"target_user_id": uid, "page_size": "12", "include_feed_video": "true"}
             if max_id:
                 form["max_id"] = max_id
-            resp = self.session.post(
-                f"{IG_WEB}/api/v1/clips/user/",
-                data=form,
-                headers={**self.headers, "referer": f"{IG_WEB}/{username}/reels/"},
-                timeout=30,
-            )
-            data = self._check(resp, f"reels of '{username}'")
-            for item in data.get("items", []):
+            data = self._call("POST", f"{IG_WEB}/api/v1/clips/user/",
+                              f"reels of '{username}' (page {page})", data=form,
+                              headers={**self.headers, "referer": f"{IG_WEB}/{username}/reels/"})
+            for item in data.get("items") or []:
                 media = item.get("media") or item
                 code = media.get("code")
                 if not code or code in seen:

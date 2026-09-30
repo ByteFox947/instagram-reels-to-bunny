@@ -1,95 +1,77 @@
 """CLI: download every reel of an Instagram profile with yt-dlp and upload to Bunny Storage."""
 
 import argparse
-import hashlib
-import json
 import logging
 import sys
-import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from .bunny import REGION_TO_PREFIX, BunnyStorage, create_storage_zone
 from .config import Config
-from .downloader import download_reel
+from .errors import FatalError, Reels2BunnyError
 from .http import make_session
 from .instagram import InstagramClient
 from .profile import ProfileReels
+from .sync import Options, Pipeline, reel_name
 
 log = logging.getLogger("reels2bunny")
 
 
-def _sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def _collect_reels(cfg: Config, args) -> tuple[str, list[dict], str | None]:
+    """Return (folder_name, reels, listing_error).
 
-
-def _date(ts) -> str:
-    if ts is None:
-        return "unknown-date"
-    if isinstance(ts, (int, float)):
-        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
-    return str(ts)[:10]  # ISO string from Graph API
-
-
-def _collect_reels(cfg: Config, args) -> tuple[str, list[dict]]:
-    """Return (folder_name, reels). Each reel has: shortcode/id, url, timestamp, caption."""
+    If listing breaks part-way (rate limit, cookies expire...) we keep what was found
+    so far and report the error, instead of throwing away the whole run.
+    """
     session = make_session()
+    reels: list[dict] = []
     if args.source == "profile":
-        finder = ProfileReels(session, args.cookies, delay=args.delay)
-        return args.username, list(finder.iter_reels(args.username))
+        folder = args.username
+        source = ProfileReels(session, args.cookies, delay=args.delay).iter_reels(args.username)
+    else:
+        cfg.require("ig_access_token")
+        folder = None
+        source = InstagramClient(cfg, session).iter_reels()
 
-    cfg.require("ig_access_token")
-    reels = []
-    for m in InstagramClient(cfg, session).iter_reels():
-        permalink = m.get("permalink") or ""
-        code = permalink.rstrip("/").rsplit("/", 1)[-1] or m["id"]
-        reels.append({
-            "shortcode": code, "id": m["id"], "url": permalink,
-            "timestamp": m.get("timestamp"), "caption": m.get("caption"),
-            "username": m.get("username"),
-        })
-    return (reels[0]["username"] if reels and reels[0].get("username") else "me"), reels
+    try:
+        for m in source:
+            if args.source == "graph":
+                permalink = m.get("permalink") or ""
+                folder = folder or m.get("username")
+                m = {"shortcode": permalink.rstrip("/").rsplit("/", 1)[-1] or m["id"],
+                     "id": m["id"], "url": permalink, "timestamp": m.get("timestamp"),
+                     "caption": m.get("caption"), "username": m.get("username")}
+            reels.append(m)
+            if len(reels) % 100 == 0:
+                log.info("  ...%d reels found so far", len(reels))
+    except Reels2BunnyError as exc:
+        if not reels:
+            raise
+        return folder or "me", reels, str(exc)
+    return folder or "me", reels, None
 
 
-def _process(reel: dict, folder: str, storage: BunnyStorage, cookies: str | None,
-             tmp_root: Path) -> str:
-    name = f"{_date(reel['timestamp'])}_{reel['shortcode']}"
-    with tempfile.TemporaryDirectory(dir=tmp_root) as tmp:
-        path, info = download_reel(reel["url"], Path(tmp), cookies)
-        ext = path.suffix or ".mp4"
-        remote = f"{folder}/{name}{ext}"
-        storage.upload_file(remote, path, _sha256(path), content_type="video/mp4")
-        meta = {
-            **reel,
-            "title": info.get("title"),
-            "duration": info.get("duration"),
-            "width": info.get("width"),
-            "height": info.get("height"),
-            "like_count": info.get("like_count"),
-            "comment_count": info.get("comment_count"),
-            "file": f"{name}{ext}",
-            "size_bytes": path.stat().st_size,
-            "backed_up_at": datetime.now(timezone.utc).isoformat(),
-        }
-        storage.upload_bytes(f"{folder}/{name}.json",
-                             json.dumps(meta, ensure_ascii=False, indent=2).encode(),
-                             content_type="application/json")
-    return remote
+def _write_failed_report(username: str, failed: list[tuple[dict, str]]) -> Path:
+    path = Path(f"failed-{username}-{datetime.now():%Y%m%d-%H%M%S}.txt")
+    with open(path, "w", encoding="utf-8") as fh:
+        for reel, err in failed:
+            fh.write(f"{reel['url']}\t{err.splitlines()[0]}\n")
+    return path
 
 
 def cmd_sync(cfg: Config, args) -> int:
     if args.source == "profile" and not args.username:
-        raise SystemExit("--username is required with --source profile")
+        raise FatalError("--username is required with --source profile")
+    if args.username:
+        args.username = args.username.strip().lstrip("@").strip("/")
     if not args.dry_run:
         cfg.require("bunny_zone", "bunny_password")
 
     log.info("Finding reels (%s)...", args.source)
-    user_folder, reels = _collect_reels(cfg, args)
+    user_folder, reels, listing_error = _collect_reels(cfg, args)
+    if listing_error:
+        log.warning("Listing stopped early after %d reels: %s", len(reels), listing_error)
+        log.warning("Continuing with the reels found; run again later to get the rest.")
     if args.limit:
         reels = reels[: args.limit]
     log.info("Found %d reels", len(reels))
@@ -97,32 +79,40 @@ def cmd_sync(cfg: Config, args) -> int:
     folder = "/".join(p for p in (cfg.bunny_base_path, user_folder) if p)
     if args.dry_run:
         for r in reels:
-            print(f"{_date(r['timestamp'])}  {r['url']}")
-        return 0
+            print(f"{reel_name(r)}  {r['url']}")
+        return 1 if listing_error else 0
 
     storage = BunnyStorage(cfg.bunny_zone, cfg.bunny_password, cfg.bunny_region, make_session())
-    existing = storage.list_files(folder)
-    todo = [r for r in reels
-            if args.force or f"{_date(r['timestamp'])}_{r['shortcode']}.json" not in existing]
-    log.info("%d already in Bunny, %d to upload -> %s/%s/",
-             len(reels) - len(todo), len(todo), cfg.bunny_zone, folder)
+    existing = storage.list_files(folder)  # also validates Bunny credentials up front
+    todo = [r for r in reels if args.force or f"{reel_name(r)}.json" not in existing]
+    skipped = len(reels) - len(todo)
+    log.info("%d already in Bunny, %d to upload -> %s/%s/ (batches of %d, %d workers)",
+             skipped, len(todo), cfg.bunny_zone, folder, args.batch_size, args.workers)
+    if not todo:
+        log.info("Nothing to do - everything is already backed up.")
+        return 1 if listing_error else 0
 
-    ok = failed = 0
-    tmp_root = Path(tempfile.gettempdir())
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(_process, r, folder, storage, args.cookies, tmp_root): r
-                   for r in todo}
-        for fut in as_completed(futures):
-            reel = futures[fut]
-            try:
-                log.info("✔ %s", fut.result())
-                ok += 1
-            except Exception as exc:
-                log.error("✘ %s: %s", reel["url"], exc)
-                failed += 1
+    opts = Options(folder=folder, cookies=args.cookies, workers=args.workers,
+                   batch_size=args.batch_size, batch_pause=args.batch_pause,
+                   retries=args.retries, work_dir=args.work_dir)
+    res = Pipeline(storage, opts).run(todo)
 
-    log.info("Done: %d uploaded, %d failed, %d skipped", ok, failed, len(reels) - len(todo))
-    return 1 if failed else 0
+    log.info("══════════ Summary ══════════")
+    log.info("Uploaded:        %d", len(res.uploaded))
+    log.info("Already in Bunny: %d", skipped)
+    log.info("Failed:          %d", len(res.failed))
+    if res.failed:
+        report = _write_failed_report(user_folder, res.failed)
+        log.info("Failed list:     %s  (run the same command again to retry them)", report)
+    if listing_error:
+        log.warning("Listing was incomplete - run again later to pick up remaining reels.")
+    if res.interrupted:
+        log.warning("Interrupted by user. Run again to continue where it stopped.")
+        return 130
+    if res.fatal:
+        log.error("Stopped early: %s", res.fatal)
+        return 2
+    return 1 if (res.failed or listing_error) else 0
 
 
 def cmd_create_zone(cfg: Config, args) -> int:
@@ -145,6 +135,13 @@ def cmd_refresh_token(cfg: Config, args) -> int:
     return 0
 
 
+def _positive_int(v: str) -> int:
+    n = int(v)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return n
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="reels2bunny", description=__doc__)
     p.add_argument("-v", "--verbose", action="store_true")
@@ -156,9 +153,18 @@ def build_parser() -> argparse.ArgumentParser:
                         "graph = official Graph API for your own Business/Creator account")
     s.add_argument("-u", "--username", help="Instagram username (for --source profile)")
     s.add_argument("-c", "--cookies", help="Netscape cookies.txt exported from a logged-in browser")
-    s.add_argument("--workers", type=int, default=3, help="Parallel downloads/uploads (default 3)")
+    s.add_argument("--batch-size", type=_positive_int, default=20,
+                   help="Reels per batch; temp files are cleaned after each batch (default 20)")
+    s.add_argument("--batch-pause", type=float, default=10,
+                   help="Seconds to wait between batches (default 10)")
+    s.add_argument("--workers", type=_positive_int, default=3,
+                   help="Parallel downloads/uploads inside a batch (default 3)")
+    s.add_argument("--retries", type=int, default=3,
+                   help="Retries per download/upload on temporary errors (default 3)")
     s.add_argument("--limit", type=int, default=0, help="Only process the N newest reels")
     s.add_argument("--delay", type=float, default=1.5, help="Seconds between listing pages")
+    s.add_argument("--work-dir", type=Path, default=None,
+                   help="Where to put temporary downloads (default: system temp)")
     s.add_argument("--force", action="store_true", help="Re-upload even if already in Bunny")
     s.add_argument("--dry-run", action="store_true", help="Only list the reels found")
     s.set_defaults(func=cmd_sync)
@@ -179,7 +185,14 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-    return args.func(Config.from_env(), args)
+    try:
+        return args.func(Config.from_env(), args)
+    except KeyboardInterrupt:
+        log.warning("Interrupted.")
+        return 130
+    except Reels2BunnyError as exc:  # expected problems: clean message, no traceback
+        log.error("%s", exc)
+        return 2
 
 
 if __name__ == "__main__":

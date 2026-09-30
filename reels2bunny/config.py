@@ -39,4 +39,5 @@ class Config:
     def require(self, *fields: str) -> None:
         missing = [f.upper() for f in fields if not getattr(self, f)]
         if missing:
-            raise SystemExit(f"Missing required config: {', '.join(missing)} (see .env.example)")
+            from .errors import FatalError
+            raise FatalError(f"Missing required config: {', '.join(missing)} (see .env.example)")

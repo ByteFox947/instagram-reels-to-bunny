@@ -5,6 +5,7 @@ from typing import Iterator
 import requests
 
 from .config import Config
+from .errors import FatalError, RetryableError
 
 MEDIA_FIELDS = ",".join(
     [
@@ -23,10 +24,6 @@ MEDIA_FIELDS = ",".join(
 )
 
 
-class InstagramError(RuntimeError):
-    pass
-
-
 class InstagramClient:
     def __init__(self, cfg: Config, session: requests.Session):
         self.cfg = cfg
@@ -40,18 +37,24 @@ class InstagramClient:
         return "/".join(parts)
 
     def _get(self, url: str, params: dict | None = None) -> dict:
-        resp = self.session.get(url, params=params, timeout=60)
+        try:
+            resp = self.session.get(url, params=params, timeout=60)
+        except requests.RequestException as exc:
+            raise RetryableError(f"Instagram API network error: {exc}") from exc
         try:
             data = resp.json()
         except ValueError:
-            resp.raise_for_status()
-            raise InstagramError(f"Non-JSON response from {url}")
-        if resp.status_code >= 400 or "error" in data:
-            err = data.get("error", {})
-            raise InstagramError(
-                f"Instagram API error {resp.status_code}: {err.get('message', data)}"
-            )
-        return data
+            raise RetryableError(f"Instagram API: non-JSON response (HTTP {resp.status_code})")
+        if resp.status_code < 400 and "error" not in data:
+            return data
+        err = data.get("error", {}) if isinstance(data, dict) else {}
+        msg = f"Instagram API error {resp.status_code}: {err.get('message', data)}"
+        if err.get("code") == 190 or resp.status_code in (401, 403):
+            raise FatalError(msg + "\n  -> access token invalid/expired; create a new one "
+                             "or run `refresh-token`")
+        if resp.status_code == 429 or resp.status_code >= 500 or err.get("code") in (4, 17, 32):
+            raise RetryableError(msg)  # rate limited / server error
+        raise FatalError(msg)
 
     def iter_media(self) -> Iterator[dict]:
         """Yield every media object on the account, following pagination."""

@@ -6,6 +6,8 @@ from urllib.parse import quote
 
 import requests
 
+from .errors import FatalError, Reels2BunnyError, RetryableError
+
 BUNNY_API = "https://api.bunny.net"
 
 # Main-region codes accepted by POST /storagezone
@@ -24,15 +26,26 @@ REGION_TO_PREFIX = {
 }
 
 
-class BunnyError(RuntimeError):
-    pass
-
-
 def storage_host(region_prefix: str) -> str:
     region_prefix = (region_prefix or "").lower()
     if region_prefix in ("", "de", "falkenstein"):
         return "storage.bunnycdn.com"
     return f"{region_prefix}.storage.bunnycdn.com"
+
+
+def _raise_for(resp: requests.Response, what: str) -> None:
+    """Turn a non-2xx Bunny response into the right error type."""
+    code = resp.status_code
+    if 200 <= code < 300:
+        return
+    body = (resp.text or "")[:300]
+    msg = f"{what}: HTTP {code} {body}".strip()
+    if code in (401, 403):
+        raise FatalError(f"{msg}\n  -> check BUNNY_STORAGE_ZONE, BUNNY_STORAGE_PASSWORD "
+                         "and BUNNY_STORAGE_REGION (must match the zone's main region)")
+    if code == 429 or code >= 500 or (code == 400 and "checksum" in body.lower()):
+        raise RetryableError(msg)  # rate limit, server error or corrupted upload
+    raise Reels2BunnyError(msg)
 
 
 class BunnyStorage:
@@ -45,30 +58,36 @@ class BunnyStorage:
     def _url(self, path: str) -> str:
         return f"{self.base}/{quote(path.strip('/'))}"
 
+    def _request(self, method: str, url: str, what: str, **kwargs) -> requests.Response:
+        try:
+            return self.session.request(method, url, **kwargs)
+        except requests.RequestException as exc:  # DNS, reset, timeout...
+            raise RetryableError(f"{what}: network error: {exc}") from exc
+
     def list_files(self, folder: str) -> set[str]:
         """Return names of files in a folder (empty set if the folder doesn't exist)."""
-        resp = self.session.get(
-            self._url(folder) + "/",
-            headers={**self.headers, "Accept": "application/json"},
-            timeout=60,
-        )
+        what = f"list Bunny folder '{folder}/'"
+        resp = self._request("GET", self._url(folder) + "/", what,
+                             headers={**self.headers, "Accept": "application/json"}, timeout=60)
         if resp.status_code == 404:
             return set()
-        if resp.status_code == 401:
-            raise BunnyError("Bunny Storage: unauthorized - check zone name/password/region")
-        resp.raise_for_status()
-        return {item["ObjectName"] for item in resp.json() if not item.get("IsDirectory")}
+        _raise_for(resp, what)
+        try:
+            return {i["ObjectName"] for i in resp.json() if not i.get("IsDirectory")}
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RetryableError(f"{what}: unexpected response") from exc
 
     def upload_file(self, remote_path: str, local_path: Path, sha256_hex: str | None = None,
                     content_type: str = "application/octet-stream") -> None:
+        """Upload a file. The file is reopened on every call, so it is safe to retry."""
         headers = {**self.headers, "Content-Type": content_type}
         if sha256_hex:
-            # Bunny verifies the upload against this checksum
-            headers["Checksum"] = sha256_hex.upper()
+            headers["Checksum"] = sha256_hex.upper()  # Bunny rejects corrupted uploads
+        what = f"upload {remote_path}"
         with open(local_path, "rb") as fh:
-            resp = self.session.put(self._url(remote_path), data=fh, headers=headers, timeout=600)
-        if resp.status_code not in (200, 201):
-            raise BunnyError(f"Upload failed ({resp.status_code}) for {remote_path}: {resp.text}")
+            resp = self._request("PUT", self._url(remote_path), what,
+                                 data=fh, headers=headers, timeout=(30, 900))
+        _raise_for(resp, what)
 
     def upload_bytes(self, remote_path: str, data: bytes,
                      content_type: str = "application/octet-stream") -> None:
@@ -77,9 +96,10 @@ class BunnyStorage:
             "Content-Type": content_type,
             "Checksum": hashlib.sha256(data).hexdigest().upper(),
         }
-        resp = self.session.put(self._url(remote_path), data=data, headers=headers, timeout=120)
-        if resp.status_code not in (200, 201):
-            raise BunnyError(f"Upload failed ({resp.status_code}) for {remote_path}: {resp.text}")
+        what = f"upload {remote_path}"
+        resp = self._request("PUT", self._url(remote_path), what,
+                             data=data, headers=headers, timeout=(30, 120))
+        _raise_for(resp, what)
 
 
 def create_storage_zone(api_key: str, name: str, region: str = "DE",
@@ -90,20 +110,26 @@ def create_storage_zone(api_key: str, name: str, region: str = "DE",
     replication = [r.upper() for r in (replication or [])]
     for r in [region, *replication]:
         if r not in ZONE_REGIONS:
-            raise BunnyError(f"Unknown region '{r}'. Valid: {', '.join(sorted(ZONE_REGIONS))}")
+            raise FatalError(f"Unknown region '{r}'. Valid: {', '.join(sorted(ZONE_REGIONS))}")
     s = session or requests.Session()
-    resp = s.post(
-        f"{BUNNY_API}/storagezone",
-        headers={"AccessKey": api_key, "Content-Type": "application/json",
-                 "Accept": "application/json"},
-        json={
-            "Name": name,
-            "Region": region,
-            "ReplicationRegions": replication,
-            "ZoneTier": 1 if ssd else 0,  # 0 = Standard (HDD), 1 = Edge (SSD)
-        },
-        timeout=60,
-    )
+    try:
+        resp = s.post(
+            f"{BUNNY_API}/storagezone",
+            headers={"AccessKey": api_key, "Content-Type": "application/json",
+                     "Accept": "application/json"},
+            json={
+                "Name": name,
+                "Region": region,
+                "ReplicationRegions": replication,
+                "ZoneTier": 1 if ssd else 0,  # 0 = Standard (HDD), 1 = Edge (SSD)
+            },
+            timeout=60,
+        )
+    except requests.RequestException as exc:
+        raise FatalError(f"Create storage zone: network error: {exc}") from exc
+    if resp.status_code in (401, 403):
+        raise FatalError("Create storage zone: unauthorized - check BUNNY_API_KEY "
+                         "(account API key, not the storage zone password)")
     if resp.status_code >= 400:
-        raise BunnyError(f"Create storage zone failed ({resp.status_code}): {resp.text}")
+        raise FatalError(f"Create storage zone failed ({resp.status_code}): {resp.text[:300]}")
     return resp.json()

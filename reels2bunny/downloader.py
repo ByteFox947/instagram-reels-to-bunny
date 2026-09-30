@@ -5,24 +5,46 @@ from pathlib import Path
 
 from yt_dlp import YoutubeDL
 
+from .errors import FatalError, RetryableError, SkipError
 
-class DownloadError(RuntimeError):
-    pass
+# Substrings of yt-dlp error messages -> how to treat them
+_SKIP = ("not available", "unavailable", "has been removed", "does not exist",
+         "no video formats", "unsupported url", "404")
+# NOTE: yt-dlp's generic "rate-limit reached or login required" message matches
+# _RETRY first (checked before _FATAL), so it is retried rather than aborting the run.
+_FATAL = ("login required", "checkpoint", "cookies are no longer valid")
+_RETRY = ("rate-limit", "rate limit", "429", "timed out", "timeout", "connection",
+          "temporarily", "5xx", "500", "502", "503", "504", "incomplete", "reset")
+
+_FFMPEG = shutil.which("ffmpeg") is not None
+
+
+def _classify(url: str, exc: Exception) -> Exception:
+    msg = str(exc)
+    low = msg.lower()
+    if any(s in low for s in _RETRY):
+        return RetryableError(f"yt-dlp: {msg}")
+    if any(s in low for s in _FATAL):
+        return FatalError(f"yt-dlp needs a valid login for {url}: {msg}\n"
+                          "  -> pass fresh cookies with --cookies")
+    if any(s in low for s in _SKIP):
+        return SkipError(f"yt-dlp: {msg}")
+    return RetryableError(f"yt-dlp: {msg}")  # unknown: retry, then give up on this reel
 
 
 def download_reel(url: str, out_dir: Path, cookies_file: str | None = None) -> tuple[Path, dict]:
     """Download `url` into out_dir. Returns (file_path, yt-dlp info dict)."""
-    has_ffmpeg = shutil.which("ffmpeg") is not None
     opts = {
         "outtmpl": str(out_dir / "%(id)s.%(ext)s"),
         # Best video+audio merged to mp4 when ffmpeg exists, otherwise best single file
-        "format": "bv*+ba/b" if has_ffmpeg else "b",
+        "format": "bv*+ba/b" if _FFMPEG else "b",
         "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "retries": 5,
-        "fragment_retries": 5,
+        "noprogress": True,
+        "retries": 3,
+        "fragment_retries": 3,
         "overwrites": True,
     }
     if cookies_file:
@@ -31,17 +53,24 @@ def download_reel(url: str, out_dir: Path, cookies_file: str | None = None) -> t
     try:
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
-    except Exception as exc:  # yt-dlp raises its own DownloadError/ExtractorError
-        raise DownloadError(f"yt-dlp failed for {url}: {exc}") from exc
+    except Exception as exc:  # yt-dlp raises DownloadError/ExtractorError wrapping the cause
+        raise _classify(url, exc) from exc
 
-    if info.get("_type") == "playlist" and info.get("entries"):
-        info = next(e for e in info["entries"] if e)
+    if not info:
+        raise SkipError(f"yt-dlp returned no info for {url}")
+    if info.get("_type") == "playlist":
+        info = next((e for e in info.get("entries") or [] if e), None)
+        if not info:
+            raise SkipError(f"no video found at {url}")
 
     downloads = info.get("requested_downloads") or []
-    path = Path(downloads[0]["filepath"]) if downloads else None
+    path = Path(downloads[0]["filepath"]) if downloads and downloads[0].get("filepath") else None
     if not path or not path.exists():
-        candidates = sorted(out_dir.glob(f"{info.get('id', '*')}.*"))
+        candidates = sorted(p for p in out_dir.glob(f"{info.get('id', '*')}.*")
+                            if not p.name.endswith((".part", ".ytdl")))
         if not candidates:
-            raise DownloadError(f"yt-dlp produced no file for {url}")
+            raise RetryableError(f"yt-dlp finished but produced no file for {url}")
         path = candidates[0]
+    if path.stat().st_size == 0:
+        raise RetryableError(f"downloaded file is empty for {url}")
     return path, info
