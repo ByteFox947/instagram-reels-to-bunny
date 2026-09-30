@@ -157,10 +157,29 @@ def _check_cdn(session, video: dict) -> None:
                          "zone, without token authentication")
 
 
+def _connect_account(cfg: Config, args, session) -> tuple[InstagramPublisher, str]:
+    """The access token decides which Instagram account gets the posts."""
+    ig = InstagramPublisher(cfg.ig_access_token, cfg.ig_user_id, cfg.ig_api_base,
+                            cfg.ig_api_version, session, poll_interval=args.poll_interval,
+                            max_wait=args.max_wait)
+    account = ig.resolve_user()
+    username = account.get("username") or "?"
+    if args.expect_username and username.lower() != args.expect_username.lstrip("@").lower():
+        raise FatalError(f"This access token belongs to @{username}, not "
+                         f"@{args.expect_username.lstrip('@')} - nothing was posted")
+    log.info("Target Instagram account: @%s (id %s)", username, ig.user_id)
+    return ig, username
+
+
 def cmd_publish(cfg: Config, args) -> int:
+    if args.ig_token:
+        cfg.ig_access_token = args.ig_token.strip()
+    if args.ig_user_id:
+        cfg.ig_user_id = args.ig_user_id.strip()
     cfg.require("ig_access_token", "bunny_zone", "bunny_password", "bunny_cdn_hostname")
     history = History(Path(args.history))
     session = make_session()
+    ig, username = _connect_account(cfg, args, session)
 
     folder = "/".join(p for p in (cfg.bunny_base_path, (args.folder or "").strip("/")) if p)
     storage = BunnyStorage(cfg.bunny_zone, cfg.bunny_password, cfg.bunny_region, session)
@@ -172,19 +191,23 @@ def cmd_publish(cfg: Config, args) -> int:
         videos = [v for v in videos if v["name"].lower() == args.video_name.lower()]
         if not videos:
             raise FatalError(f"Video '{args.video_name}' not found in {folder or 'zone root'}/")
+    for v in videos:  # history is per account: the same video can go to several accounts
+        v["key"] = f"{ig.user_id}:{v['key']}"
+        v["account"] = username
 
     done = history.published()
     pending = [v for v in videos if args.force or v["key"] not in done]
     skipped = len(videos) - len(pending)
     if args.limit:
         pending = pending[: args.limit]
-    log.info("%d already published, %d to publish", skipped, len(pending))
+    log.info("%d already published to @%s, %d to publish", skipped, username, len(pending))
     if not pending:
-        log.info("Nothing to do - everything in this folder is already on Instagram.")
+        log.info("Nothing to do - everything in this folder is already on @%s.", username)
         return 0
 
     template = _caption_template(args)
     if args.dry_run:
+        print(f"Would publish to @{username}:")
         for i, v in enumerate(pending, 1):
             print(f"{i:>4}. {v['name']}  ({v['size_bytes'] / 1_048_576:.1f} MB)  {v['cdn_url']}")
         print(f"\nBatches of {args.batch_size}: {-(-len(pending) // args.batch_size)} batch(es)")
@@ -192,11 +215,6 @@ def cmd_publish(cfg: Config, args) -> int:
               f"{_render_caption(template, pending[0], storage) or '(empty)'}\n---")
         return 0
 
-    ig = InstagramPublisher(cfg.ig_access_token, cfg.ig_user_id, cfg.ig_api_base,
-                            cfg.ig_api_version, session, poll_interval=args.poll_interval,
-                            max_wait=args.max_wait)
-    account = ig.resolve_user()
-    log.info("Publishing to @%s (id %s)", account.get("username", "?"), ig.user_id)
     _check_cdn(session, pending[0])
 
     for v in pending:  # render captions up front so a caption problem shows before posting
@@ -230,11 +248,16 @@ def cmd_publish(cfg: Config, args) -> int:
 
 def cmd_links(cfg: Config, args) -> int:
     published = History(Path(args.history)).published()
+    if args.account:
+        want = args.account.lstrip("@").lower()
+        published = {k: v for k, v in published.items()
+                     if (v.get("account") or "").lower() == want}
     if args.format == "csv":
         print(", ".join(v["permalink"] for v in published.values() if v.get("permalink")))
     else:
-        print(json.dumps([{"video": k, "reel_link": v.get("permalink"),
-                           "media_id": v.get("media_id"), "published_at": v.get("published_at")}
+        print(json.dumps([{"account": v.get("account"), "video": k.split(":", 1)[-1],
+                           "reel_link": v.get("permalink"), "media_id": v.get("media_id"),
+                           "published_at": v.get("published_at")}
                           for k, v in published.items()], indent=2, ensure_ascii=False))
     return 0
 
@@ -294,6 +317,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_sync)
 
     pb = sub.add_parser("publish", help="Publish videos from Bunny Storage as Instagram Reels")
+    pb.add_argument("--ig-token", help="Access token of the account to post to "
+                    "(overrides IG_ACCESS_TOKEN). The token decides the target account")
+    pb.add_argument("--ig-user-id", help="Numeric IG user id (default: looked up from the token)")
+    pb.add_argument("--expect-username",
+                    help="Safety check: stop unless the token belongs to this username")
     pb.add_argument("-f", "--folder", default="",
                     help="Bunny folder with the videos, e.g. the username used by `sync`")
     cap = pb.add_mutually_exclusive_group()
@@ -329,6 +357,7 @@ def build_parser() -> argparse.ArgumentParser:
     ln = sub.add_parser("links", help="Print links of published Reels from the history")
     ln.add_argument("--format", choices=["json", "csv"], default="json")
     ln.add_argument("--history", default="instagram_uploads.json")
+    ln.add_argument("--account", help="Only links posted to this username")
     ln.set_defaults(func=cmd_links)
 
     z = sub.add_parser("create-zone", help="Create a new Bunny storage zone")

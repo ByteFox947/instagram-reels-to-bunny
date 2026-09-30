@@ -276,7 +276,8 @@ class PublishPipeline:
                 code, _ = self.ig.container_status(prev["container_id"], name)
                 if code == "PUBLISHED":
                     log.info("  [%s] was already published in an earlier run", name)
-                    self.history.update(key, status="PUBLISHED", note="found published on rerun")
+                    self.history.update(key, status="PUBLISHED", account=video.get("account"),
+                                        note="found published on rerun")
                     return {**video, "media_id": prev.get("media_id"),
                             "permalink": prev.get("permalink")}
                 if code in ("FINISHED", "IN_PROGRESS"):
@@ -322,7 +323,8 @@ class PublishPipeline:
 
         # 4. permalink
         permalink = self.ig.permalink(media_id, self.stop) if media_id else None
-        self.history.update(key, status="PUBLISHED", media_id=media_id, permalink=permalink,
+        self.history.update(key, status="PUBLISHED", account=video.get("account"),
+                            media_id=media_id, permalink=permalink,
                             container_id=container_id, cdn_url=video["cdn_url"],
                             published_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         return {**video, "media_id": media_id, "permalink": permalink}

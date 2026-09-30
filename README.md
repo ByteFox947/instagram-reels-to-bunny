@@ -144,6 +144,19 @@ python -m reels2bunny links --format csv      # or --format json
 | `--history` | `instagram_uploads.json` | Record of what was posted, used to prevent duplicates |
 | `--force` | off | Post again even if it's already in the history |
 
+**Which account gets the posts:** the access token decides it. Each token belongs to one
+Instagram account, and the tool looks up that account before posting. To post to another
+account, pass its token:
+
+```bash
+python -m reels2bunny publish -f <folder> --ig-token "<TOKEN_OF_ACCOUNT_2>" \
+    --expect-username account2 --caption "{original}"
+```
+
+`--expect-username` is a safety check: if the token belongs to a different account, nothing
+is posted. The history is kept per account, so the same videos can go to several accounts
+without affecting each other. Use `links --account account2` to see one account's Reels.
+
 **Batches and the daily limit:** before each batch, the tool asks Instagram how many API posts
 are left in the rolling 24-hour window. If fewer are left than `--batch-size`, the batch is
 shrunk to fit. When none are left, the run stops with exit code `3`. Run the same command
@@ -168,6 +181,20 @@ still downloads them with yt-dlp:
 python -m reels2bunny sync --source graph -c cookies.txt
 python -m reels2bunny refresh-token   # long-lived tokens expire after 60 days
 ```
+
+## Run on Google Colab
+
+Open `colab.ipynb` in Colab: File → Open notebook → GitHub tab → paste the repo URL. Then:
+
+1. Add your Bunny details and one `IG_TOKEN_…` per Instagram account as **Colab Secrets** (🔑).
+   If the repo is private, also add `GITHUB_TOKEN`.
+2. Run the cells from top to bottom. They clone the repo, install yt-dlp (ffmpeg is already in
+   Colab) and mount Google Drive. The history file and `cookies.txt` are kept in
+   `MyDrive/reels2bunny`, so they survive Colab restarts.
+3. Fill in the form fields (username, token secret name, batch size…). Run once with
+   `DRY_RUN` ticked, then untick it.
+
+If Colab disconnects, run the cells again. Finished work is skipped.
 
 ## Configuration (`.env`)
 
