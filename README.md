@@ -99,6 +99,65 @@ Failed reels are also written to `failed-<username>-<time>.txt`.
 Exit codes: `0` all done · `1` some reels failed or listing incomplete · `2` stopped on a
 fatal error · `130` interrupted.
 
+## Publish videos from Bunny to Instagram (access token, in batches)
+
+`publish` takes the videos in a Bunny folder and posts them as Reels to **your** Instagram
+Business/Creator account through the official Content Publishing API. Only post videos you
+own or have the rights to.
+
+Setup in `.env`:
+- `IG_ACCESS_TOKEN` (or `INSTAGRAM_TOKEN`): a token with `instagram_business_content_publish`
+- `BUNNY_CDN_HOSTNAME`: a pull zone linked to the storage zone, e.g. `my-reels.b-cdn.net`.
+  Instagram downloads each video from `https://<host>/<folder>/<file>`, so the pull zone
+  must not use token authentication.
+
+```bash
+# Preview: list the videos, batch count and caption, without posting anything
+python -m reels2bunny publish -f <username> --caption-file caption.txt --dry-run
+
+# Publish in batches of 5, 2 at a time, 2 minutes between batches
+python -m reels2bunny publish -f <username> --caption-file caption.txt \
+    --batch-size 5 --workers 2 --batch-pause 120
+
+# Reuse the original caption that `sync` saved, and add your own text
+python -m reels2bunny publish -f <username> --caption "{original}
+
+#myhashtag"
+
+# Print the links of every Reel published so far
+python -m reels2bunny links --format csv      # or --format json
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `-f, --folder` | zone root | Bunny folder that holds the videos (the username from `sync`) |
+| `--caption` / `--caption-file` / `--original-caption` | empty | Caption text. `{original}` = original caption from the `.json`, `{name}` = file name |
+| `--batch-size` | 10 | Videos per batch |
+| `--workers` | 2 | Videos processed in parallel inside a batch |
+| `--batch-pause` | 60 | Seconds between batches |
+| `--limit` | – | Publish at most N videos in this run |
+| `--retries` | 3 | Retries on temporary Instagram errors (10s, 30s, 90s) |
+| `--newest-first` | off | Default order is oldest first, by file name |
+| `--reels-tab-only` | off | Don't also show the Reel in the main feed grid |
+| `--max-wait` | 600 | Max seconds to wait for Instagram to process a video |
+| `--video-name` | – | Publish a single file |
+| `--history` | `instagram_uploads.json` | Record of what was posted, used to prevent duplicates |
+| `--force` | off | Post again even if it's already in the history |
+
+**Batches and the daily limit:** before each batch, the tool asks Instagram how many API posts
+are left in the rolling 24-hour window. If fewer are left than `--batch-size`, the batch is
+shrunk to fit. When none are left, the run stops with exit code `3`. Run the same command
+later and it continues where it stopped.
+
+**No duplicate posts:** each video's progress is saved in the history file straight away. If
+a run crashes or the publish reply is lost, the next run checks the saved Instagram upload
+and reuses it, or marks it done if it's already live. A publish request is only retried after
+confirming the Reel isn't already live.
+
+**Errors:** a bad or expired token, a missing permission or an unreachable CDN URL stops the
+run (exit `2`). A video Instagram can't process is skipped and marked `FAILED` in the history,
+so the next run tries it again. Network errors and rate limits are retried.
+
 ### Alternative: official Graph API (your own Business/Creator account)
 
 This mode needs no cookies or scraping. It lists your reels with the Instagram Graph API and
@@ -119,6 +178,7 @@ python -m reels2bunny refresh-token   # long-lived tokens expire after 60 days
 | `BUNNY_STORAGE_REGION` | Empty = Falkenstein, or `uk`, `ny`, `la`, `sg`, `se`, `br`, `jh`, `syd` |
 | `BUNNY_BASE_PATH` | Optional parent folder for the `<username>/` folders (default: none, so the username folder sits at the zone root) |
 | `BUNNY_API_KEY` | Account API key, only for `create-zone` |
+| `BUNNY_CDN_HOSTNAME` | Pull zone hostname, only for `publish` |
 | `IG_ACCESS_TOKEN`, `IG_USER_ID`, `IG_API_BASE`, `IG_API_VERSION` | Only for `--source graph` |
 
 ## Troubleshooting

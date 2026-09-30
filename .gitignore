@@ -4,3 +4,5 @@ __pycache__/
 .venv/
 failed-*.txt
 cookies.txt
+instagram_uploads.json
+*.tmp

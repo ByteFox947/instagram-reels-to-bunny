@@ -6,8 +6,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def _env(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
+def _env(name: str, default: str = "", *aliases: str) -> str:
+    """Read an env var, falling back to alias names (e.g. INSTAGRAM_TOKEN)."""
+    for key in (name, *aliases):
+        val = os.getenv(key, "").strip()
+        if val:
+            return val
+    return default
 
 
 @dataclass
@@ -21,14 +26,18 @@ class Config:
     bunny_region: str
     bunny_base_path: str
     bunny_api_key: str
+    bunny_cdn_hostname: str
 
     @classmethod
     def from_env(cls) -> "Config":
+        cdn = _env("BUNNY_CDN_HOSTNAME")
+        cdn = cdn.replace("https://", "").replace("http://", "").strip("/")
         return cls(
-            ig_access_token=_env("IG_ACCESS_TOKEN"),
-            ig_user_id=_env("IG_USER_ID", "me") or "me",
+            ig_access_token=_env("IG_ACCESS_TOKEN", "", "INSTAGRAM_TOKEN"),
+            ig_user_id=_env("IG_USER_ID", "me", "INSTAGRAM_USER_ID"),
             ig_api_base=_env("IG_API_BASE", "https://graph.instagram.com").rstrip("/"),
-            ig_api_version=_env("IG_API_VERSION").strip("/"),
+            ig_api_version=_env("IG_API_VERSION", "", "INSTAGRAM_API_VERSION").strip("/"),
+            bunny_cdn_hostname=cdn,
             bunny_zone=_env("BUNNY_STORAGE_ZONE"),
             bunny_password=_env("BUNNY_STORAGE_PASSWORD"),
             bunny_region=_env("BUNNY_STORAGE_REGION").lower(),

@@ -66,16 +66,30 @@ class BunnyStorage:
 
     def list_files(self, folder: str) -> set[str]:
         """Return names of files in a folder (empty set if the folder doesn't exist)."""
+        return {e["ObjectName"] for e in self.list_entries(folder)}
+
+    def list_entries(self, folder: str) -> list[dict]:
+        """Return Bunny's file entries (ObjectName, Length, DateCreated...) in a folder."""
         what = f"list Bunny folder '{folder}/'"
         resp = self._request("GET", self._url(folder) + "/", what,
                              headers={**self.headers, "Accept": "application/json"}, timeout=60)
         if resp.status_code == 404:
-            return set()
+            return []
         _raise_for(resp, what)
         try:
-            return {i["ObjectName"] for i in resp.json() if not i.get("IsDirectory")}
+            return [i for i in resp.json() if not i.get("IsDirectory") and i["ObjectName"]]
         except (ValueError, KeyError, TypeError) as exc:
             raise RetryableError(f"{what}: unexpected response") from exc
+
+    def read_bytes(self, remote_path: str) -> bytes | None:
+        """Download a (small) file from storage; None if it doesn't exist."""
+        what = f"read {remote_path}"
+        resp = self._request("GET", self._url(remote_path), what,
+                             headers=self.headers, timeout=60)
+        if resp.status_code == 404:
+            return None
+        _raise_for(resp, what)
+        return resp.content
 
     def upload_file(self, remote_path: str, local_path: Path, sha256_hex: str | None = None,
                     content_type: str = "application/octet-stream") -> None:

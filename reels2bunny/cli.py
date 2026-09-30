@@ -1,6 +1,7 @@
 """CLI: download every reel of an Instagram profile with yt-dlp and upload to Bunny Storage."""
 
 import argparse
+import json
 import logging
 import sys
 from datetime import datetime
@@ -12,6 +13,8 @@ from .errors import FatalError, Reels2BunnyError
 from .http import make_session
 from .instagram import InstagramClient
 from .profile import ProfileReels
+from .publisher import (History, InstagramPublisher, PublishOptions, PublishPipeline,
+                        build_candidates, fit_caption)
 from .sync import Options, Pipeline, reel_name
 
 log = logging.getLogger("reels2bunny")
@@ -115,6 +118,127 @@ def cmd_sync(cfg: Config, args) -> int:
     return 1 if (res.failed or listing_error) else 0
 
 
+def _caption_template(args) -> str:
+    if args.caption_file:
+        try:
+            return Path(args.caption_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise FatalError(f"Can't read caption file {args.caption_file}: {exc}")
+    if args.caption is not None:
+        return args.caption
+    return "{original}" if args.original_caption else ""
+
+
+def _render_caption(template: str, video: dict, storage: BunnyStorage) -> str:
+    """Fill {original} (caption saved by `sync` in the .json next to the video) and {name}."""
+    text = template.replace("{name}", Path(video["name"]).stem)
+    if "{original}" in text:
+        original = ""
+        raw = storage.read_bytes(video["path"].rsplit(".", 1)[0] + ".json")
+        if raw:
+            try:
+                original = json.loads(raw).get("caption") or ""
+            except ValueError:
+                log.warning("  [%s] metadata .json is not valid JSON", video["name"])
+        text = text.replace("{original}", original)
+    return fit_caption(text)
+
+
+def _check_cdn(session, video: dict) -> None:
+    """Instagram fetches the video from the CDN URL, so it must be publicly reachable."""
+    try:
+        resp = session.head(video["cdn_url"], timeout=20, allow_redirects=True)
+    except Exception as exc:  # network trouble here shouldn't block the run
+        log.warning("Couldn't check CDN URL %s: %s", video["cdn_url"], exc)
+        return
+    if resp.status_code >= 400:
+        raise FatalError(f"CDN URL not reachable (HTTP {resp.status_code}): {video['cdn_url']}\n"
+                         "  -> BUNNY_CDN_HOSTNAME must be a pull zone linked to this storage "
+                         "zone, without token authentication")
+
+
+def cmd_publish(cfg: Config, args) -> int:
+    cfg.require("ig_access_token", "bunny_zone", "bunny_password", "bunny_cdn_hostname")
+    history = History(Path(args.history))
+    session = make_session()
+
+    folder = "/".join(p for p in (cfg.bunny_base_path, (args.folder or "").strip("/")) if p)
+    storage = BunnyStorage(cfg.bunny_zone, cfg.bunny_password, cfg.bunny_region, session)
+    videos = build_candidates(storage.list_entries(folder), folder, cfg.bunny_cdn_hostname,
+                              cfg.bunny_zone)
+    videos.sort(key=lambda v: v["name"], reverse=args.newest_first)
+    log.info("Found %d videos in %s/%s/", len(videos), cfg.bunny_zone, folder)
+    if args.video_name:
+        videos = [v for v in videos if v["name"].lower() == args.video_name.lower()]
+        if not videos:
+            raise FatalError(f"Video '{args.video_name}' not found in {folder or 'zone root'}/")
+
+    done = history.published()
+    pending = [v for v in videos if args.force or v["key"] not in done]
+    skipped = len(videos) - len(pending)
+    if args.limit:
+        pending = pending[: args.limit]
+    log.info("%d already published, %d to publish", skipped, len(pending))
+    if not pending:
+        log.info("Nothing to do - everything in this folder is already on Instagram.")
+        return 0
+
+    template = _caption_template(args)
+    if args.dry_run:
+        for i, v in enumerate(pending, 1):
+            print(f"{i:>4}. {v['name']}  ({v['size_bytes'] / 1_048_576:.1f} MB)  {v['cdn_url']}")
+        print(f"\nBatches of {args.batch_size}: {-(-len(pending) // args.batch_size)} batch(es)")
+        print(f"Caption preview for {pending[0]['name']}:\n---\n"
+              f"{_render_caption(template, pending[0], storage) or '(empty)'}\n---")
+        return 0
+
+    ig = InstagramPublisher(cfg.ig_access_token, cfg.ig_user_id, cfg.ig_api_base,
+                            cfg.ig_api_version, session, poll_interval=args.poll_interval,
+                            max_wait=args.max_wait)
+    account = ig.resolve_user()
+    log.info("Publishing to @%s (id %s)", account.get("username", "?"), ig.user_id)
+    _check_cdn(session, pending[0])
+
+    for v in pending:  # render captions up front so a caption problem shows before posting
+        v["caption"] = _render_caption(template, v, storage)
+        v["force"] = args.force
+
+    opts = PublishOptions(workers=args.workers, batch_size=args.batch_size,
+                          batch_pause=args.batch_pause, retries=args.retries,
+                          share_to_feed=not args.reels_tab_only)
+    res = PublishPipeline(ig, history, opts).run(pending)
+
+    log.info("══════════ Publish summary ══════════")
+    log.info("Published:         %d", len(res.published))
+    log.info("Already published: %d", skipped)
+    log.info("Failed:            %d", len([f for f in res.failed
+                                             if not f[1].startswith("not started")]))
+    log.info("Not started:       %d", res.not_started)
+    for v in res.published:
+        log.info("  • %s -> %s", v["name"], v.get("permalink") or v.get("media_id"))
+    for v, err in res.failed:
+        if not err.startswith("not started"):
+            log.info("  ✘ %s: %s", v["name"], err.splitlines()[0])
+    log.info("History: %s", Path(args.history).resolve())
+    if res.interrupted:
+        return 130
+    if res.fatal:
+        (log.warning if res.quota_stop else log.error)("Stopped: %s", res.fatal)
+        return 3 if res.quota_stop else 2
+    return 1 if res.failed else 0
+
+
+def cmd_links(cfg: Config, args) -> int:
+    published = History(Path(args.history)).published()
+    if args.format == "csv":
+        print(", ".join(v["permalink"] for v in published.values() if v.get("permalink")))
+    else:
+        print(json.dumps([{"video": k, "reel_link": v.get("permalink"),
+                           "media_id": v.get("media_id"), "published_at": v.get("published_at")}
+                          for k, v in published.items()], indent=2, ensure_ascii=False))
+    return 0
+
+
 def cmd_create_zone(cfg: Config, args) -> int:
     cfg.require("bunny_api_key")
     zone = create_storage_zone(cfg.bunny_api_key, args.name, args.region,
@@ -168,6 +292,44 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--force", action="store_true", help="Re-upload even if already in Bunny")
     s.add_argument("--dry-run", action="store_true", help="Only list the reels found")
     s.set_defaults(func=cmd_sync)
+
+    pb = sub.add_parser("publish", help="Publish videos from Bunny Storage as Instagram Reels")
+    pb.add_argument("-f", "--folder", default="",
+                    help="Bunny folder with the videos, e.g. the username used by `sync`")
+    cap = pb.add_mutually_exclusive_group()
+    cap.add_argument("--caption", help="Caption text. Supports {original} and {name}")
+    cap.add_argument("--caption-file", help="Read caption from a UTF-8 text file")
+    cap.add_argument("--original-caption", action="store_true",
+                     help="Use the original caption saved by `sync` in the .json metadata")
+    pb.add_argument("--batch-size", type=_positive_int, default=10,
+                    help="Videos per batch (default 10); shrunk to the remaining 24h quota")
+    pb.add_argument("--batch-pause", type=float, default=60,
+                    help="Seconds to wait between batches (default 60)")
+    pb.add_argument("--workers", type=_positive_int, default=2,
+                    help="Videos published in parallel inside a batch (default 2)")
+    pb.add_argument("--retries", type=int, default=3,
+                    help="Retries on temporary Instagram errors (default 3)")
+    pb.add_argument("--limit", type=int, default=0, help="Publish at most N videos this run")
+    pb.add_argument("--video-name", help="Publish only this file name")
+    pb.add_argument("--newest-first", action="store_true",
+                    help="Publish newest files first (default: oldest first, by file name)")
+    pb.add_argument("--reels-tab-only", action="store_true",
+                    help="Don't also show the Reel in the main feed grid")
+    pb.add_argument("--poll-interval", type=float, default=6,
+                    help="Seconds between processing-status checks (default 6)")
+    pb.add_argument("--max-wait", type=float, default=600,
+                    help="Max seconds to wait for Instagram to process a video (default 600)")
+    pb.add_argument("--history", default="instagram_uploads.json",
+                    help="History file that prevents duplicate posts")
+    pb.add_argument("--force", action="store_true", help="Publish again even if already posted")
+    pb.add_argument("--dry-run", action="store_true",
+                    help="Show what would be published (and the caption), post nothing")
+    pb.set_defaults(func=cmd_publish)
+
+    ln = sub.add_parser("links", help="Print links of published Reels from the history")
+    ln.add_argument("--format", choices=["json", "csv"], default="json")
+    ln.add_argument("--history", default="instagram_uploads.json")
+    ln.set_defaults(func=cmd_links)
 
     z = sub.add_parser("create-zone", help="Create a new Bunny storage zone")
     z.add_argument("--name", required=True, help="Zone name (globally unique)")
