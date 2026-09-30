@@ -14,7 +14,7 @@ from typing import Iterator
 
 import requests
 
-from .errors import FatalError, RetryableError
+from .errors import FatalError, RetryableError, SkipError
 
 log = logging.getLogger("reels2bunny")
 
@@ -41,6 +41,7 @@ class ProfileReels:
         self.session = session
         self.delay = delay
         self.retries = retries
+        self._uid: dict[str, str] = {}
         if cookies_file:
             load_cookies(session, cookies_file)
         else:
@@ -100,6 +101,8 @@ class ProfileReels:
         return data
 
     def user_id(self, username: str) -> str:
+        if username in self._uid:
+            return self._uid[username]
         what = f"profile '{username}'"
         data = self._call("GET", f"{IG_WEB}/api/v1/users/web_profile_info/", what,
                           params={"username": username},
@@ -109,7 +112,8 @@ class ProfileReels:
             raise FatalError(f"{what} not found")
         if user.get("is_private") and not user.get("followed_by_viewer"):
             raise FatalError(f"{what} is private and the logged-in account doesn't follow it")
-        return str(user["id"])
+        self._uid[username] = str(user["id"])
+        return self._uid[username]
 
     def iter_reels(self, username: str) -> Iterator[dict]:
         """Yield {'shortcode','id','timestamp','caption','url'} for every reel on the profile."""
@@ -133,6 +137,7 @@ class ProfileReels:
                 seen.add(code)
                 caption = media.get("caption") or {}
                 yield {
+                    "kind": "reel",
                     "shortcode": code,
                     "id": str(media.get("pk") or media.get("id") or code),
                     "timestamp": media.get("taken_at"),
@@ -145,3 +150,83 @@ class ProfileReels:
             if not paging.get("more_available") or not max_id:
                 break
             time.sleep(self.delay)  # be gentle, avoid rate limits
+
+    # ------------------------------------------------------------ feed posts
+    @staticmethod
+    def _best(candidates: list[dict] | None) -> dict | None:
+        """Pick the largest image/video version."""
+        cands = [c for c in candidates or [] if c.get("url")]
+        if not cands:
+            return None
+        return max(cands, key=lambda c: (c.get("width") or 0) * (c.get("height") or 0))
+
+    def _media_item(self, m: dict) -> dict | None:
+        """One photo or video (a single post, or one slide of a carousel)."""
+        if m.get("media_type") == 2 or m.get("video_versions"):
+            best = self._best(m.get("video_versions"))
+            kind = "video"
+        else:
+            best = self._best((m.get("image_versions2") or {}).get("candidates"))
+            kind = "image"
+        if not best:
+            return None
+        return {"type": kind, "url": best["url"], "width": best.get("width"),
+                "height": best.get("height")}
+
+    def parse_post(self, media: dict, username: str) -> dict | None:
+        code = media.get("code")
+        if not code:
+            return None
+        caption = media.get("caption") or {}
+        base = {
+            "shortcode": code,
+            "id": str(media.get("pk") or media.get("id") or code),
+            "timestamp": media.get("taken_at"),
+            "caption": caption.get("text") if isinstance(caption, dict) else None,
+            "like_count": media.get("like_count"),
+            "comment_count": media.get("comment_count"),
+            "username": username,
+        }
+        if media.get("product_type") == "clips":  # a reel that also shows in the grid
+            return {**base, "kind": "reel", "url": f"{IG_WEB}/reel/{code}/"}
+        slides = media.get("carousel_media") or [media]
+        items = [i for i in (self._media_item(s) for s in slides) if i]
+        if not items:
+            return None
+        return {**base, "kind": "post", "url": f"{IG_WEB}/p/{code}/",
+                "post_type": "carousel" if media.get("media_type") == 8 else items[0]["type"],
+                "items": items}
+
+    def iter_posts(self, username: str) -> Iterator[dict]:
+        """Yield every post of the profile grid (photos, carousels, videos, grid reels)."""
+        uid = self.user_id(username)
+        max_id = ""
+        seen: set[str] = set()
+        page = 0
+        while True:
+            page += 1
+            params = {"count": "12"}
+            if max_id:
+                params["max_id"] = max_id
+            data = self._call("GET", f"{IG_WEB}/api/v1/feed/user/{uid}/",
+                              f"posts of '{username}' (page {page})", params=params,
+                              headers={**self.headers, "referer": f"{IG_WEB}/{username}/"})
+            for media in data.get("items") or []:
+                post = self.parse_post(media, username)
+                if post and post["shortcode"] not in seen:
+                    seen.add(post["shortcode"])
+                    yield post
+            max_id = data.get("next_max_id") or ""
+            if not data.get("more_available") or not max_id:
+                break
+            time.sleep(self.delay)
+
+    def refresh_post(self, post: dict) -> dict:
+        """Get fresh media URLs for a post (Instagram's CDN links expire after a while)."""
+        data = self._call("GET", f"{IG_WEB}/api/v1/media/{post['id']}/info/",
+                          f"refresh post {post['shortcode']}", headers=self.headers)
+        media = (data.get("items") or [None])[0]
+        fresh = self.parse_post(media, post["username"]) if media else None
+        if not fresh or fresh["kind"] != "post":
+            raise SkipError(f"post {post['shortcode']} is no longer available")
+        return fresh

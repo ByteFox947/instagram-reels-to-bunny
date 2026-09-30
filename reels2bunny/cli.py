@@ -20,38 +20,72 @@ from .sync import Options, Pipeline, reel_name
 log = logging.getLogger("reels2bunny")
 
 
-def _collect_reels(cfg: Config, args) -> tuple[str, list[dict], str | None]:
-    """Return (folder_name, reels, listing_error).
+def _collect_items(cfg: Config, args, finder: ProfileReels | None
+                   ) -> tuple[str, list[dict], str | None]:
+    """Return (folder_name, items, listing_error). Items are reels and/or posts.
 
     If listing breaks part-way (rate limit, cookies expire...) we keep what was found
     so far and report the error, instead of throwing away the whole run.
     """
-    session = make_session()
-    reels: list[dict] = []
-    if args.source == "profile":
-        folder = args.username
-        source = ProfileReels(session, args.cookies, delay=args.delay).iter_reels(args.username)
-    else:
+    items: list[dict] = []
+    if args.source == "graph":
+        if args.type != "reels":
+            raise FatalError("--type posts/all needs --source profile (the default)")
         cfg.require("ig_access_token")
         folder = None
-        source = InstagramClient(cfg, session).iter_reels()
-
-    try:
-        for m in source:
-            if args.source == "graph":
+        try:
+            for m in InstagramClient(cfg, make_session()).iter_reels():
                 permalink = m.get("permalink") or ""
                 folder = folder or m.get("username")
-                m = {"shortcode": permalink.rstrip("/").rsplit("/", 1)[-1] or m["id"],
-                     "id": m["id"], "url": permalink, "timestamp": m.get("timestamp"),
-                     "caption": m.get("caption"), "username": m.get("username")}
-            reels.append(m)
-            if len(reels) % 100 == 0:
-                log.info("  ...%d reels found so far", len(reels))
-    except Reels2BunnyError as exc:
-        if not reels:
-            raise
-        return folder or "me", reels, str(exc)
-    return folder or "me", reels, None
+                items.append({"kind": "reel",
+                              "shortcode": permalink.rstrip("/").rsplit("/", 1)[-1] or m["id"],
+                              "id": m["id"], "url": permalink, "timestamp": m.get("timestamp"),
+                              "caption": m.get("caption"), "username": m.get("username")})
+        except Reels2BunnyError as exc:
+            if not items:
+                raise
+            return folder or "me", items, str(exc)
+        return folder or "me", items, None
+
+    sources = []
+    if args.type in ("reels", "all"):
+        sources.append(("reels", finder.iter_reels))
+    if args.type in ("posts", "all"):
+        sources.append(("posts", finder.iter_posts))
+    seen: set[str] = set()
+    errors: list[str] = []
+    for label, list_fn in sources:
+        log.info("Listing %s of @%s...", label, args.username)
+        try:
+            for m in list_fn(args.username):
+                # the posts grid also contains reels: skip them for --type posts,
+                # and don't save a reel twice for --type all
+                if m["shortcode"] in seen or (args.type == "posts" and m["kind"] == "reel"):
+                    continue
+                seen.add(m["shortcode"])
+                items.append(m)
+                if len(items) % 100 == 0:
+                    log.info("  ...%d found so far", len(items))
+        except Reels2BunnyError as exc:
+            if isinstance(exc, FatalError) and not items:
+                raise
+            errors.append(f"{label}: {exc}")
+    if errors and not items:
+        raise FatalError("; ".join(errors))
+    return args.username, items, "; ".join(errors) or None
+
+
+def _describe(items: list[dict]) -> str:
+    reels = sum(1 for i in items if i["kind"] == "reel")
+    posts = [i for i in items if i["kind"] == "post"]
+    photos = sum(1 for p in posts if p.get("post_type") == "image")
+    carousels = sum(1 for p in posts if p.get("post_type") == "carousel")
+    videos = len(posts) - photos - carousels
+    parts = [f"{reels} reels"] if reels else []
+    if posts:
+        parts.append(f"{len(posts)} posts ({photos} photos, {carousels} carousels, "
+                     f"{videos} videos)")
+    return ", ".join(parts) or "nothing"
 
 
 def _write_failed_report(username: str, failed: list[tuple[dict, str]]) -> Path:
@@ -70,24 +104,34 @@ def cmd_sync(cfg: Config, args) -> int:
     if not args.dry_run:
         cfg.require("bunny_zone", "bunny_password")
 
-    log.info("Finding reels (%s)...", args.source)
-    user_folder, reels, listing_error = _collect_reels(cfg, args)
+    session = make_session()
+    finder = (ProfileReels(session, args.cookies, delay=args.delay)
+              if args.source == "profile" else None)
+    user_folder, reels, listing_error = _collect_items(cfg, args, finder)
     if listing_error:
-        log.warning("Listing stopped early after %d reels: %s", len(reels), listing_error)
-        log.warning("Continuing with the reels found; run again later to get the rest.")
+        log.warning("Listing stopped early after %d items: %s", len(reels), listing_error)
+        log.warning("Continuing with what was found; run again later to get the rest.")
     if args.limit:
         reels = reels[: args.limit]
-    log.info("Found %d reels", len(reels))
+    log.info("Found %s", _describe(reels))
 
     folder = "/".join(p for p in (cfg.bunny_base_path, user_folder) if p)
     if args.dry_run:
         for r in reels:
-            print(f"{reel_name(r)}  {r['url']}")
+            kind = r.get("post_type", "reel") if r["kind"] == "post" else "reel"
+            count = f" ({len(r['items'])} items)" if r["kind"] == "post" else ""
+            cap = (r.get("caption") or "").replace("\n", " ")[:50]
+            print(f"{reel_name(r)}  {kind:<8}{count:<11} {r['url']}  {cap}")
         return 1 if listing_error else 0
 
-    storage = BunnyStorage(cfg.bunny_zone, cfg.bunny_password, cfg.bunny_region, make_session())
+    storage = BunnyStorage(cfg.bunny_zone, cfg.bunny_password, cfg.bunny_region, session)
     existing = storage.list_files(folder)  # also validates Bunny credentials up front
-    todo = [r for r in reels if args.force or f"{reel_name(r)}.json" not in existing]
+    if any(r["kind"] == "post" for r in reels):
+        existing_posts = storage.list_files(f"{folder}/posts")
+    else:
+        existing_posts = set()
+    todo = [r for r in reels if args.force or f"{reel_name(r)}.json" not in
+            (existing_posts if r["kind"] == "post" else existing)]
     skipped = len(reels) - len(todo)
     log.info("%d already in Bunny, %d to upload -> %s/%s/ (batches of %d, %d workers)",
              skipped, len(todo), cfg.bunny_zone, folder, args.batch_size, args.workers)
@@ -98,7 +142,8 @@ def cmd_sync(cfg: Config, args) -> int:
     opts = Options(folder=folder, cookies=args.cookies, workers=args.workers,
                    batch_size=args.batch_size, batch_pause=args.batch_pause,
                    retries=args.retries, work_dir=args.work_dir)
-    res = Pipeline(storage, opts).run(todo)
+    res = Pipeline(storage, opts, session=session,
+                   refresh=finder.refresh_post if finder else None).run(todo)
 
     log.info("══════════ Summary ══════════")
     log.info("Uploaded:        %d", len(res.uploaded))
@@ -299,6 +344,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="profile = find reels from a profile username (default); "
                         "graph = official Graph API for your own Business/Creator account")
     s.add_argument("-u", "--username", help="Instagram username (for --source profile)")
+    s.add_argument("-t", "--type", choices=["reels", "posts", "all"], default="reels",
+                   help="reels = Reels tab (default); posts = photos, carousels and videos "
+                        "from the grid; all = both")
     s.add_argument("-c", "--cookies", help="Netscape cookies.txt exported from a logged-in browser")
     s.add_argument("--batch-size", type=_positive_int, default=20,
                    help="Reels per batch; temp files are cleaned after each batch (default 20)")
