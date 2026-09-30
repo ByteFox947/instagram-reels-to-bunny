@@ -32,7 +32,7 @@ class Config:
             bunny_zone=_env("BUNNY_STORAGE_ZONE"),
             bunny_password=_env("BUNNY_STORAGE_PASSWORD"),
             bunny_region=_env("BUNNY_STORAGE_REGION").lower(),
-            bunny_base_path=_env("BUNNY_BASE_PATH", "instagram/reels").strip("/"),
+            bunny_base_path=_env("BUNNY_BASE_PATH", "").strip("/"),
             bunny_api_key=_env("BUNNY_API_KEY"),
         )
 

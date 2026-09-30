@@ -16,11 +16,11 @@ with a JSON metadata file next to it. Runs are incremental: reels already in Bun
 3. **Upload:** sends the file to Bunny Storage with a SHA-256 `Checksum` header, so Bunny
    rejects corrupted uploads. A `.json` metadata file goes next to it.
 
-Result layout in the zone:
+Result layout in the zone (one folder per username):
 
 ```
-instagram/reels/<username>/2024-02-01_C2xYz123.mp4
-instagram/reels/<username>/2024-02-01_C2xYz123.json
+<username>/2024-02-01_C2xYz123.mp4
+<username>/2024-02-01_C2xYz123.json
 ```
 
 ## Setup
@@ -86,7 +86,7 @@ python -m reels2bunny refresh-token   # long-lived tokens expire after 60 days
 | `BUNNY_STORAGE_ZONE` | Storage zone name |
 | `BUNNY_STORAGE_PASSWORD` | Zone password (FTP & API Access) |
 | `BUNNY_STORAGE_REGION` | Empty = Falkenstein, or `uk`, `ny`, `la`, `sg`, `se`, `br`, `jh`, `syd` |
-| `BUNNY_BASE_PATH` | Folder in the zone (default `instagram/reels`) |
+| `BUNNY_BASE_PATH` | Optional parent folder for the `<username>/` folders (default: none, so the username folder sits at the zone root) |
 | `BUNNY_API_KEY` | Account API key, only for `create-zone` |
 | `IG_ACCESS_TOKEN`, `IG_USER_ID`, `IG_API_BASE`, `IG_API_VERSION` | Only for `--source graph` |
 
