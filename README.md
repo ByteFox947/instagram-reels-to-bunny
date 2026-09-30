@@ -20,9 +20,32 @@ with a JSON metadata file next to it. Runs are incremental: reels already in Bun
 Result layout in the zone (one folder per username):
 
 ```
-<username>/2024-02-01_C2xYz123.mp4
-<username>/2024-02-01_C2xYz123.json
+<username>/2024-02-01_C2xYz123.mp4           reel
+<username>/2024-02-01_C2xYz123.json          reel caption + details
+<username>/posts/2024-01-02_CARO1/01.jpg     carousel slide 1
+<username>/posts/2024-01-02_CARO1/02.mp4     carousel slide 2 (video)
+<username>/posts/2024-01-02_CARO1.json       post caption + details + slide order
+<username>/posts/2024-01-01_PHOTO1/01.jpg    single photo
+<username>/posts/2024-01-01_PHOTO1.json
 ```
+
+### Photos, carousels and video posts (`--type`)
+
+| `--type` | What is saved |
+|---|---|
+| `reels` (default) | Everything in the profile's Reels tab |
+| `posts` | Photo, carousel and video posts from the main grid |
+| `all` | Both. Reels that also appear in the grid are only saved once |
+
+```bash
+python -m reels2bunny sync -u USERNAME -c cookies.txt --type all
+```
+
+Photos are saved at the largest size available, and carousel slides keep their order
+(`01`, `02`, …). The caption is saved exactly as it was, with line breaks, emojis, hashtags and
+@mentions, in the `.json` file together with the date, likes and comment count. Instagram's
+media links expire after a while; if that happens mid-run, the tool fetches fresh links
+automatically.
 
 ## Setup
 

@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Callable, TypeVar
 
 from .bunny import BunnyStorage
-from .downloader import download_reel
+from .downloader import CONTENT_TYPES, UrlExpired, download_reel, download_url
 from .errors import FatalError, RetryableError, SkipError
 
 log = logging.getLogger("reels2bunny")
@@ -82,9 +82,12 @@ def _sha256(path: Path) -> str:
 
 
 class Pipeline:
-    def __init__(self, storage: BunnyStorage, opts: Options):
+    def __init__(self, storage: BunnyStorage, opts: Options, session=None,
+                 refresh: Callable[[dict], dict] | None = None):
         self.storage = storage
         self.opts = opts
+        self.session = session          # for direct photo/video downloads
+        self.refresh = refresh          # gets fresh media links for a post
         self.stop = threading.Event()
 
     # ---------------------------------------------------------------- helpers
@@ -105,6 +108,62 @@ class Pipeline:
                 if self.stop.wait(wait):  # wake up early if the run is stopping
                     raise Stopped()
         raise AssertionError("unreachable")
+
+    def process_item(self, item: dict, batch_dir: Path) -> str:
+        if item.get("kind") == "post":
+            return self.process_post(item, batch_dir)
+        return self.process_reel(item, batch_dir)
+
+    # ------------------------------------------------------ one photo post / carousel
+    def _download_slide(self, post: dict, index: int, dest_stem: Path) -> Path:
+        slide = post["items"][index]
+        default = ".mp4" if slide["type"] == "video" else ".jpg"
+        try:
+            return download_url(self.session, slide["url"], dest_stem, default)
+        except UrlExpired:
+            if not self.refresh:
+                raise
+            log.info("  %s: media link expired, fetching fresh links", post["shortcode"])
+            fresh = self.refresh(post)
+            if len(fresh["items"]) != len(post["items"]):
+                raise SkipError("post was edited on Instagram while backing it up")
+            post["items"] = fresh["items"]
+            return download_url(self.session, post["items"][index]["url"], dest_stem, default)
+
+    def process_post(self, post: dict, batch_dir: Path) -> str:
+        """Photo, carousel or video post -> posts/<name>/01.jpg, 02.mp4 ... + posts/<name>.json"""
+        name = reel_name(post)
+        work = batch_dir / name
+        work.mkdir(parents=True, exist_ok=True)
+        folder = f"{self.opts.folder}/posts"
+        files, total = [], 0
+        try:
+            for i in range(len(post["items"])):
+                stem = f"{i + 1:02d}"
+                path = self._retry(f"download {name} item {i + 1}/{len(post['items'])}",
+                                   lambda: self._download_slide(post, i, work / stem))
+                remote = f"{folder}/{name}/{path.name}"
+                checksum, size = _sha256(path), path.stat().st_size
+                ctype = CONTENT_TYPES.get(path.suffix, "application/octet-stream")
+                self._retry(f"upload {name}/{path.name}",
+                            lambda: self.storage.upload_file(remote, path, checksum, ctype))
+                slide = post["items"][i]
+                files.append({"file": f"{name}/{path.name}", "type": slide["type"],
+                              "width": slide.get("width"), "height": slide.get("height"),
+                              "size_bytes": size, "sha256": checksum})
+                total += size
+                path.unlink(missing_ok=True)  # free disk right away
+            meta = {k: v for k, v in post.items() if k != "items"}
+            meta.update(items=files, item_count=len(files),
+                        backed_up_at=datetime.now(timezone.utc).isoformat())
+            body = json.dumps(meta, ensure_ascii=False, indent=2).encode()
+            self._retry(f"upload {name}.json",  # uploaded last = "done" marker
+                        lambda: self.storage.upload_bytes(f"{folder}/{name}.json", body,
+                                                          "application/json"))
+            return (f"{folder}/{name}/ ({post.get('post_type', 'post')}, {len(files)} "
+                    f"item{'s' if len(files) != 1 else ''}, {total / 1_048_576:.1f} MB)")
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
 
     # -------------------------------------------------------------- one reel
     def process_reel(self, reel: dict, batch_dir: Path) -> str:
@@ -185,7 +244,7 @@ class Pipeline:
         batch_dir.mkdir(parents=True, exist_ok=True)
         transient = 0
         pool = ThreadPoolExecutor(max_workers=max(1, self.opts.workers))
-        futures = {pool.submit(self.process_reel, r, batch_dir): r for r in batch}
+        futures = {pool.submit(self.process_item, r, batch_dir): r for r in batch}
         try:
             for fut in as_completed(futures):
                 reel = futures[fut]
